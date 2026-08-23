@@ -12,10 +12,11 @@
 
 // 2026.08.23 第二版
 // 桥接接口升级至 v2（window.shiguangBridge / window.shiguangBridgePromise）。
-// 补充开学日期：从首页日历区块取当前学期起止日期写入 semesterStartDate，总周数改为按实际周次取值；
-// 取不到开学日期时跳过配置保存，避免覆盖用户已有设置。
+// 补充开学日期：从校历接口 xskbcxZccx_cxZcByXnxq 取所选学年学期的第 1 周起始日写入 semesterStartDate，
+// 总周数取校历周数；取不到校历时跳过配置保存，避免覆盖用户已有设置。
 // 课程备注补充重修标记、选课备注（体育项目、微专业等）与周次原文。
 // 集中实践课（军训、毕业设计等）无星期节次无法排课，改为弹窗提示手动添加。
+// 作息时间不随切令时自动变化，导入后弹窗提示下次切令时日期。
 // 教师与教室为空不再丢弃课程；修正京江各号楼的楼栋匹配；支持校外 WebVPN 访问。
 
 /**
@@ -407,21 +408,25 @@ function getSemesterCode(semesterIndex) {
 
 
 /**
- * 获取教务系统当前学期的起止日期。
- * 首页日历区块的标题形如 "2026-2027学年1学期(2026-08-31至2027-02-21)"，
- * 其中起始日期就是第 1 周周一，正是 semesterStartDate 需要的值。
- * 注意：该接口忽略 xnm/xqm 参数，只返回当前学期，
- * 因此只有用户选择的学年学期与返回值一致时才能使用。
+ * 获取指定学年学期的校历周次。
+ *
+ * 接口按周次顺序返回数组，每个元素代表一周：
+ * rq 形如 "2026-08-31/2026-09-06"，zs 是周次序号。
+ * 第 1 周的起始日（周一）就是 semesterStartDate 需要的开学日期，
+ * 数组长度就是教务排的总周数。
+ * 与首页日历区块不同，这个接口尊重 xnm/xqm 参数，历史学期同样能取到；
+ * 尚未排出校历的学期返回空数组。
  */
-async function fetchCurrentSemesterRange() {
-    const url = buildApiUrl("/xtgl/index_cxAreaFive.html?localeKey=zh_CN&gnmkdm=index");
+async function fetchSemesterWeeks(academicYear, semesterCode) {
+    const url = buildApiUrl("/kbcx/xskbcxZccx_cxZcByXnxq.html?gnmkdm=N2154");
 
     try {
         const response = await fetch(url, {
             "headers": {
                 "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "x-requested-with": "XMLHttpRequest"
             },
-            "body": "",
+            "body": `xnm=${academicYear}&xqm=${semesterCode}`,
             "method": "POST",
             "credentials": "include"
         });
@@ -430,25 +435,28 @@ async function fetchCurrentSemesterRange() {
             throw new Error(`状态码 ${response.status}`);
         }
 
-        const html = await response.text();
-        const match = html.match(/(\d{4})-\d{4}学年(\d)学期\s*[（(](\d{4}-\d{2}-\d{2})至(\d{4}-\d{2}-\d{2})[）)]/);
+        const weekList = JSON.parse(await response.text());
 
-        if (!match) {
-            console.warn("JS: 未能从日历区块解析出学期起止日期。");
+        if (!Array.isArray(weekList) || weekList.length === 0) {
+            console.warn("JS: 校历接口未返回周次数据，该学期可能尚未排出校历。");
             return null;
         }
 
-        const range = {
-            academicYear: match[1],
-            semesterIndex: Number(match[2]) - 1,
-            startDate: match[3],
-            endDate: match[4]
-        };
-        console.log("JS: 教务系统当前学期:", range);
+        // 正常情况下数组已按周次排好，仍按 zs 找一次第 1 周，避免顺序变化时取错日期。
+        const firstWeek = weekList.find((item) => Number(item.zs) === 1) || weekList[0];
+        const startDate = String(firstWeek.rq || "").split("/")[0].trim();
+
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+            console.warn("JS: 校历接口返回的日期无法识别:", firstWeek.rq);
+            return null;
+        }
+
+        const range = { startDate: startDate, totalWeeks: weekList.length };
+        console.log("JS: 校历周次:", range);
         return range;
 
     } catch (error) {
-        console.warn("JS: 获取学期起止日期失败:", error);
+        console.warn("JS: 获取校历周次失败:", error);
         return null;
     }
 }
@@ -463,24 +471,16 @@ async function fetchCurrentSemesterRange() {
  * defaultClassDuration / defaultBreakDuration 不显式传入，会被重置为应用默认的 45 / 10 分钟，
  * 与江大「45 分钟一节、课间 10 分钟」一致，因此没有副作用。
  */
-function buildCourseConfig(courses, semesterRange, firstDayOfWeek) {
+function buildCourseConfig(semesterRange, firstDayOfWeek) {
     if (!semesterRange) {
         return null;
     }
 
-    let maxWeek = 0;
-    for (const course of courses) {
-        for (const week of course.weeks) {
-            if (week > maxWeek) {
-                maxWeek = week;
-            }
-        }
-    }
-
     return {
         semesterStartDate: semesterRange.startDate,
-        // 只增不减：默认 20 周，课表里出现更大的周次时才扩展。
-        semesterTotalWeeks: Math.max(maxWeek, 20),
+        // 直接采用校历周数。校历含考试周与假期周，比实际上课周多几周，
+        // 但这个值只是课表的周次上限：多几周空白无害，少了会截断课程。
+        semesterTotalWeeks: semesterRange.totalWeeks,
         firstDayOfWeek: firstDayOfWeek
     };
 }
@@ -579,25 +579,9 @@ async function saveCourses(parsedCourses) {
  * 拿不到就完全不调用 saveCourseConfig —— 应用侧是整体覆盖，
  * 传入不含 semesterStartDate 的配置会把用户已设置的开学日期清空。
  */
-async function saveCourseConfigIfPossible(courses, academicYear, semesterIndex, firstDayOfWeek) {
-    const semesterRange = await fetchCurrentSemesterRange();
-
-    let usableRange = null;
-    if (semesterRange) {
-        const sameYear = semesterRange.academicYear === String(academicYear);
-        const sameSemester = semesterRange.semesterIndex === semesterIndex;
-
-        if (sameYear && sameSemester) {
-            usableRange = semesterRange;
-        } else {
-            console.log(
-                `JS: 所选学年学期(${academicYear}/第${semesterIndex + 1}学期)` +
-                `不是教务系统当前学期(${semesterRange.academicYear}/第${semesterRange.semesterIndex + 1}学期)，跳过开学日期写入。`
-            );
-        }
-    }
-
-    const config = buildCourseConfig(courses, usableRange, firstDayOfWeek);
+async function saveCourseConfigIfPossible(academicYear, semesterIndex, firstDayOfWeek) {
+    const semesterRange = await fetchSemesterWeeks(academicYear, getSemesterCode(semesterIndex));
+    const config = buildCourseConfig(semesterRange, firstDayOfWeek);
 
     if (!config) {
         window.shiguangBridge.showToast("未取到本学期开学日期，已跳过课表配置，请在应用内手动设置开学日期。");
@@ -921,7 +905,7 @@ async function runImportFlow() {
         return;
     }
 
-    await saveCourseConfigIfPossible(coursesWithCustomTime, academicYear, semesterIndex, firstDayOfWeek);
+    await saveCourseConfigIfPossible(academicYear, semesterIndex, firstDayOfWeek);
 
     await importPresetTimeSlots(isSummerTime ? SummerTimeSlots : WinterTimeSlots);
 
