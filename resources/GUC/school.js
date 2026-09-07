@@ -1,15 +1,28 @@
 // 吉利学院(GUC) 拾光课程表适配脚本
 // YETHAN以专教学信息服务平台
 // 该教务系统带图片验证码，需用户在页面内手动登录，脚本基于已登录会话(Cookie)拉取课表
-// 非该大学学生适配可能无法登录,出现问题请通过issues提交反馈
 // 桥接 API 使用 v2：window.shiguangBridge(同步) / window.shiguangBridgePromise(异步)
+
+
+//*****吐槽（>-<）*****
+// ===== YETHAN 系统特性（适配脚本为何做了这么多特判） =====
+// 1. 页面标题错乱：课表页 <title>="学生个人信息"、重修页="选课日志"（模板没改标题）
+// 2. 无校历/学期开始日期字段——开学日期只能从"按周查课表"表头偷（且表头只有"03月02日"无年份，年份需页头学年/最近年份推算）
+// 3. 课程数据脏：编号/课名/括号挤一行（如 "B1001 高等数学（4）"），全角括号混用、教师可能缺失、地点可为 NoRoom
+// 4. 课表视图分裂：全部周次视图表头无日期，仅按周(weekNo=N)视图表头带日期
+// 5. 学生年级/学历等字段经接口加密下发、无干净字段（故无法按学号可靠推算"大几"，只显示真实学年学期）
+// 6. 功能集中在单 Action（CourseAction?setAction=...）按字符串分发，无 REST
+
 
 // ==================== 常量 ====================
 
 // 课表页面地址（selectTableType: ThisTerm=本学期, NextTerm=下学期）
 const COURSE_TABLE_URL = "https://jw.guc.edu.cn/yethan/CourseAction?setAction=userCourseScheduleTable&viewType=studentCourseTableWeek&selectTableType=";
 
-// 默认导入本学期（学校系统仅支持查看本学期课表）；如需下学期请改为 "NextTerm"
+// 课表表单提交地址（"按周次查课表"用 POST 提交，weekNo=1 请求用于解析开学日期，复刻页面表单）
+const COURSE_ACTION_URL = "https://jw.guc.edu.cn/yethan/CourseAction";
+
+// 默认导入学期（用户在选择学期弹窗中取消时回退到本学期）
 const SELECT_TABLE_TYPE = "ThisTerm";
 
 // 拉取课表请求超时时间（毫秒）
@@ -58,7 +71,7 @@ function parseWeeks(weekStr) {
 }
 
 /**
- * 解析一行课程文本，如 "B4708 大学英语（4）（李博）"。
+ * 解析一行课程文本，如 "B3001 体育与健康（4）（张睿）"（课名带版本号括号，教师为最后一个全角括号）。
  * 返回 { name, teacher }，无法解析时返回 null。
  * 兼容情况：
  *   - 未选课前课程可能无教师（如 "B1001 高等数学"），此时 teacher 为空串，课程保留；
@@ -184,15 +197,23 @@ function mergeAndDistinctCourses(courses) {
 }
 
 /**
+ * 解析课表 HTML，返回表格的所有行（<tr> 数组）。找不到表格返回空数组。
+ * 供解析课程/作息/开学日期复用，统一课表表格入口。
+ */
+function getTableRows(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const table = doc.querySelector("table.table_border");
+    return table ? Array.from(table.querySelectorAll("tr")) : [];
+}
+
+/**
  * 解析课表 HTML 表格为课程模型数组。
  */
 function parseTimetableToCourses(html) {
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    const table = doc.querySelector("table.table_border");
-    if (!table) return [];
+    const rows = getTableRows(html);
+    if (rows.length === 0) return [];
 
     const results = [];
-    const rows = Array.from(table.querySelectorAll("tr"));
 
     for (const row of rows) {
         const cells = Array.from(row.querySelectorAll("td"));
@@ -244,7 +265,50 @@ function parseTimetableToCourses(html) {
     return mergeAndDistinctCourses(results);
 }
 
+/**
+ * 从课表 HTML 动态提取作息时间（节次 + 上课时间列，如 "08:20-09:05"）。
+ * 返回 [{ number, startTime, endTime }]；无有效节次时返回 null（由调用方回退写死常量）。
+ * 表头行（节次为"节"字）与 rowspan 跨节的空节次行经 parseInt 后自然跳过。
+ */
+function parseTimeSlots(html) {
+    try {
+        const rows = getTableRows(html);
+        if (rows.length === 0) return null;
+        const slots = [];
+        for (const row of rows) {
+            const cells = Array.from(row.querySelectorAll("td"));
+            if (cells.length < 2) continue;
+            const number = parseInt(cells[0].textContent.trim(), 10);
+            if (isNaN(number) || number < 1) continue;
+            const timeText = (cells[1].textContent || "").trim();
+            const m = timeText.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
+            if (!m) continue;
+            slots.push({ number: number, startTime: m[1], endTime: m[2] });
+        }
+        if (slots.length === 0) return null;
+        slots.sort((a, b) => a.number - b.number);
+        return slots;
+    } catch (e) {
+        console.error("解析作息时间失败:", e);
+        return null;
+    }
+}
+
 // ==================== 网络请求 ====================
+
+/**
+ * 带超时的 fetch 封装：统一 AbortController 超时与登录会话 Cookie(credentials: "include")。
+ * 超时/网络异常由调用方 catch 处理。
+ */
+async function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+        return await fetch(url, Object.assign({ credentials: "include" }, options, { signal: controller.signal }));
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * 拉取本学期课表页面并检测登录状态（一次请求完成）。
@@ -255,14 +319,9 @@ function parseTimetableToCourses(html) {
  *   - { error: "request_failed" }  HTTP 请求失败（非 2xx）
  *   - { error: "no_table" }        已登录但页面无课表
  */
-async function fetchTimetableOnce() {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+async function fetchTimetableOnce(semesterType) {
     try {
-        const resp = await fetch(COURSE_TABLE_URL + SELECT_TABLE_TYPE + "&queryType=student", {
-            credentials: "include",
-            signal: controller.signal
-        });
+        const resp = await fetchWithTimeout(COURSE_TABLE_URL + semesterType + "&queryType=student");
         if (!resp.ok) return { error: "request_failed" };
         const html = await resp.text();
         if (html.includes('id="ranstring"') || html.includes("LoginForm")) return { error: "not_logged_in" };
@@ -271,9 +330,154 @@ async function fetchTimetableOnce() {
     } catch (e) {
         console.error("获取课表失败:", e);
         return { error: "network" };
-    } finally {
-        clearTimeout(timer);
     }
+}
+
+/**
+ * 请求第 1 周课表（POST，复刻页面"查周课表"表单，weekNo=1）。
+ * 第 1 周视图的表头带日期（如 "星期一<br>03月02日"），用于解析开学日期。
+ * 成功返回响应 HTML；任何失败返回 null（不阻断主流程，开学日期缺失时 App 端可手动设置）。
+ */
+async function fetchWeek1Timetable(semesterType) {
+    try {
+        const resp = await fetchWithTimeout(COURSE_ACTION_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+            body: new URLSearchParams({
+                setAction: "userCourseScheduleTable",
+                viewType: "studentCourseTableWeek",
+                selectTableType: semesterType,
+                queryType: "student",
+                weekNo: "1"
+            }).toString()
+        });
+        if (!resp.ok) return null;
+        return await resp.text();
+    } catch (e) {
+        console.error("获取第1周课表失败:", e);
+        return null;
+    }
+}
+
+/**
+ * 从第 1 周课表 HTML 解析开学日期（第一周第一天 = 表头"星期一"的日期）。
+ * 返回 "yyyy-MM-dd"（官方 CourseConfigJsonModel 格式）；解析失败返回 null。
+ *
+ * 年份策略（两步）：
+ *   1) 优先页头学年解析："2025-2026第2学期" → 第1学期取学年首年(秋季)、第2学期取学年次年(春季)；
+ *   2) 兜底：取 "MM月DD日" 距今天最近的年份（候选: 去年/今年/明年）。
+ *      依据：教务系统仅显示本学期，开学日必然距今天不足半年，最近年份即正确年份。
+ */
+function parseSemesterStartDate(html) {
+    try {
+        const rows = getTableRows(html);
+        if (rows.length === 0) return null;
+        const headerRow = rows[0];
+        const cells = headerRow ? Array.from(headerRow.querySelectorAll("td")) : [];
+        // 表头：[0]=节, [1]=上课时间, [2]=星期一 ...
+        if (cells.length < 3) return null;
+        const mondayText = cells[2].textContent || ""; // 如 "星期一03月02日"
+        const m = mondayText.match(/(\d{1,2})月(\d{1,2})日/);
+        if (!m) return null;
+        const month = parseInt(m[1], 10);
+        const day = parseInt(m[2], 10);
+        if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+        // 年份：优先页头学年解析
+        let year = null;
+        const termMatch = html.match(/(20\d{2})\s*[-—]\s*(20\d{2})第?(\d)学期/);
+        if (termMatch) {
+            const y1 = parseInt(termMatch[1], 10);
+            const y2 = parseInt(termMatch[2], 10);
+            const termNo = parseInt(termMatch[3], 10);
+            if (y2 === y1 + 1 && (termNo === 1 || termNo === 2)) {
+                year = termNo === 2 ? y2 : y1; // 第1学期=首年(秋季)，第2学期=次年(春季)
+            }
+        }
+
+        // 兜底：距今天最近的年份
+        if (!year) {
+            const now = new Date();
+            const thisYear = now.getFullYear();
+            let best = thisYear;
+            let bestDiff = Infinity;
+            for (const y of [thisYear - 1, thisYear, thisYear + 1]) {
+                const d = new Date(y, month - 1, day);
+                const diff = Math.abs(d - now);
+                if (diff < bestDiff) { bestDiff = diff; best = y; }
+            }
+            year = best;
+        }
+
+        const pad = n => String(n).padStart(2, "0");
+        return `${year}-${pad(month)}-${pad(day)}`;
+    } catch (e) {
+        console.error("解析开学日期失败:", e);
+        return null;
+    }
+}
+
+// ==================== 学期选择 ====================
+
+/**
+ * 从选课页 HTML 解析真实学期名（如 "2025-2026第2学期"）。
+ * 页头 userInfo 形如 "学号 姓名 <span>2025-2026第2学期</span> 课表"。
+ * 解析失败返回 null（由调用方回退使用通用名）。
+ */
+function parseSemesterLabel(html) {
+    const m = html.match(/(\d{4}-\d{4}第\d学期)/);
+    return m ? m[1] : null;
+}
+
+/**
+ * 探测指定学期的真实学期名。请求选课页(userCourseSchedule)拿页头学期标识；
+ * 任何失败返回 null（调用方回退用通用名"本学期/下学期"）。
+ */
+async function fetchSemesterLabel(type) {
+    try {
+        const resp = await fetchWithTimeout(COURSE_ACTION_URL + "?setAction=userCourseSchedule&selectTableType=" + type);
+        if (!resp.ok) return null;
+        return parseSemesterLabel(await resp.text());
+    } catch (e) {
+        console.error("探测学期名失败(", type, "):", e);
+        return null;
+    }
+}
+
+/**
+ * 让用户选择导入学期。用 showSingleSelection 显示两个学期的真实学期名
+ * （如 "2025-2026第2学期" / "2026-2027第1学期"，比"本学期/下学期"更明确）；
+ * 探测不到真实名时回退显示通用名。取消返回默认本学期(ThisTerm)。
+ */
+async function selectSemester() {
+    const kinds = [
+        { value: "ThisTerm", label: "本学期" },
+        { value: "NextTerm", label: "下学期" }
+    ];
+    const labels = await Promise.all(kinds.map(k => fetchSemesterLabel(k.value)));
+    const names = kinds.map((k, i) => labels[i] || k.label);
+    const idx = await window.shiguangBridgePromise.showSingleSelection("选择导入学期", JSON.stringify(names), 0);
+    if (idx == null || idx === undefined || idx === -1) return SELECT_TABLE_TYPE;
+    return (kinds[idx] || kinds[0]).value;
+}
+
+/**
+ * 构造课表配置：学期总周数（取课程最大周）+ 开学日期（可选）。
+ * 开学日期：请求第 1 周课表，取表头"星期一"日期作为第一周第一天（"yyyy-MM-dd"，官方格式）；
+ * 请求失败或解析失败时不设置该字段（App 端可手动设置），不影响课程导入。
+ */
+async function fetchCourseConfig(semesterType, courses) {
+    const maxWeek = courses.reduce((max, c) => Math.max(max, Math.max(...c.weeks)), 0);
+    const config = { semesterTotalWeeks: Math.max(maxWeek, 1) };
+    const week1Html = await fetchWeek1Timetable(semesterType);
+    if (week1Html) {
+        const semesterStartDate = parseSemesterStartDate(week1Html);
+        if (semesterStartDate) {
+            config.semesterStartDate = semesterStartDate;
+            console.log("开学日期:", semesterStartDate);
+        }
+    }
+    return config;
 }
 
 // ==================== 主流程 ====================
@@ -299,9 +503,10 @@ async function runImportFlow() {
         return;
     }
 
-    // 2. 拉取本学期课表并检测登录状态
+    // 2. 选择导入学期（默认本学期），并拉取该学期课表、检测登录状态
+    const semesterType = await selectSemester();
     BRIDGE.showToast("正在获取课表数据...");
-    const result = await fetchTimetableOnce();
+    const result = await fetchTimetableOnce(semesterType);
     if (result.error === "not_logged_in") {
         await BRIDGE_P.showAlert(
             "未检测到登录状态",
@@ -321,10 +526,10 @@ async function runImportFlow() {
     }
     const html = result.html;
 
-    // 3. 解析课程（默认本学期）
+    // 3. 解析课程（所选学期）
     const courses = parseTimetableToCourses(html);
     if (courses.length === 0) {
-        BRIDGE.showToast("未解析到课程数据，请确认本学期是否有课程");
+        BRIDGE.showToast("未解析到课程数据，请确认所选学期是否有课程");
         return;
     }
     console.log("解析到课程记录数:", courses.length, courses);
@@ -338,18 +543,18 @@ async function runImportFlow() {
         return;
     }
 
-    // 5. 保存作息时间
+    // 5. 保存作息时间（优先从课表"上课时间"列动态提取，学校调作息后无需改代码；提取失败回退写死常量）
     try {
-        await BRIDGE_P.savePresetTimeSlots(JSON.stringify(TIME_SLOTS));
+        const timeSlots = parseTimeSlots(html) || TIME_SLOTS;
+        await BRIDGE_P.savePresetTimeSlots(JSON.stringify(timeSlots));
         BRIDGE.showToast("作息时间保存成功");
     } catch (e) {
         BRIDGE.showToast("作息时间保存失败: " + e.message);
     }
 
-    // 6. 保存课表配置（按课程数据中的最大周数设置学期总周数）
+    // 6. 保存课表配置（学期总周数 + 开学日期）
     try {
-        const maxWeek = courses.reduce((max, c) => Math.max(max, Math.max(...c.weeks)), 0);
-        const config = { semesterTotalWeeks: Math.max(maxWeek, 1) };
+        const config = await fetchCourseConfig(semesterType, courses);
         await BRIDGE_P.saveCourseConfig(JSON.stringify(config));
     } catch (e) {
         BRIDGE.showToast("课表配置保存失败: " + e.message);

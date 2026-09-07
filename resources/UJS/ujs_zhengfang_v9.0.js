@@ -121,6 +121,62 @@ function parsePracticeCourses(jsonData) {
 }
 
 /**
+ * 拼接教务系统接口地址。
+ * 校内直连时 location.origin 就是教务域名，前缀为空；
+ * 校外经 WebVPN 访问时路径带有 /http/<hex> 前缀，必须保留，否则会变成跨域请求。
+ */
+function buildApiUrl(path) {
+    const prefixMatch = window.location.pathname.match(/^\/http\/[0-9a-f]+/i);
+    const prefix = prefixMatch ? prefixMatch[0] : "";
+    return window.location.origin + prefix + path;
+}
+
+/**
+ * 拼装课程备注。
+ * xm 只有姓名，kcmc 只有课程名，以下信息只存在于原始字段里，
+ * 放进备注方便用户核对：重修标记、选课备注（体育项目、微专业等）、周次原文。
+ */
+function buildCourseRemark(rawCourse) {
+    const parts = [];
+
+    const retakeFlag = String(rawCourse.cxbjmc || "").trim();
+    if (retakeFlag) {
+        parts.push(retakeFlag);
+    }
+
+    const selectionNote = String(rawCourse.xkbz || "").trim();
+    if (selectionNote) {
+        parts.push(selectionNote);
+    }
+
+    const weekDesc = String(rawCourse.zcd || "").trim();
+    if (weekDesc) {
+        parts.push(weekDesc);
+    }
+
+    return parts.join(" | ");
+}
+
+/**
+ * 解析集中实践课列表（sjkList）。
+ * 这类课程（军事技能训练、形势与政策等）只有课程名、教师和起止周，
+ * 没有星期和节次，无法映射到周课表，只能提示用户手动添加。
+ */
+function parsePracticeCourses(jsonData) {
+    if (!jsonData || !Array.isArray(jsonData.sjkList)) {
+        return [];
+    }
+
+    return jsonData.sjkList
+        .map((item) => ({
+            name: String(item.kcmc || "").trim(),
+            teacher: String(item.jsxm || "").trim(),
+            weekDesc: String(item.qsjsz || "").trim()
+        }))
+        .filter((item) => item.name);
+}
+
+/**
  * 解析 API 返回的 JSON 数据。
  */
 function parseJsonData(jsonData) {
@@ -136,6 +192,10 @@ function parseJsonData(jsonData) {
     const finalCourseList = [];
 
     for (const rawCourse of rawCourseList) {
+        // 关键字段检查：只有 kcmc(课名), xqj(星期), jcs(节次范围), zcd(周次描述) 是排课必需的。
+        // xm(教师) 与 cdmc(教室) 在实践课、线上课、未排地点的课程上可能为空，
+        // 缺这两项不影响排课，不能因此丢弃整门课程。
+        if (!rawCourse.kcmc || !rawCourse.xqj || !rawCourse.jcs || !rawCourse.zcd) {
         // 关键字段检查：只有 kcmc(课名), xqj(星期), jcs(节次范围), zcd(周次描述) 是排课必需的。
         // xm(教师) 与 cdmc(教室) 在实践课、线上课、未排地点的课程上可能为空，
         // 缺这两项不影响排课，不能因此丢弃整门课程。
@@ -169,10 +229,23 @@ function parseJsonData(jsonData) {
             name: String(rawCourse.kcmc).trim(),
             teacher: String(rawCourse.xm || "").trim(),
             position: String(rawCourse.cdmc || "").trim(),
+        const remark = buildCourseRemark(rawCourse);
+
+        const course = {
+            name: String(rawCourse.kcmc).trim(),
+            teacher: String(rawCourse.xm || "").trim(),
+            position: String(rawCourse.cdmc || "").trim(),
             day: day,
             startSection: startSection,
             endSection: endSection,
             weeks: weeksArray
+        };
+
+        if (remark) {
+            course.remark = remark;
+        }
+
+        finalCourseList.push(course);
         };
 
         if (remark) {
@@ -257,6 +330,7 @@ async function whetherSummerTimeSlot() {
     // } catch (error) {
     //     console.error('JS: 获取作息时间公告失败:', error);
     //     window.shiguangBridge.showToast("无法获取作息时间公告，智能选择回退到预设时间。");
+    //     window.shiguangBridge.showToast("无法获取作息时间公告，智能选择回退到预设时间。");
 
     //     // 预设日期
     //     const summerStart = new Date(new Date().getFullYear(), 3, 7); // 4月7日
@@ -273,9 +347,12 @@ async function whetherSummerTimeSlot() {
     // CORS 问题导致无法获取公告页，智能选择回退到预设时间。
     // 冬令时是十一假期结束后调整，取 10 月 7 日；夏令时公告历年均为 4 月 7 日起执行。
     // 参考教务处历年作息时间表公告：https://jwc.ujs.edu.cn/index/xl_zuo_xi_shi_jian.htm
+    // 冬令时是十一假期结束后调整，取 10 月 7 日；夏令时公告历年均为 4 月 7 日起执行。
+    // 参考教务处历年作息时间表公告：https://jwc.ujs.edu.cn/index/xl_zuo_xi_shi_jian.htm
 
     // 预设日期
     const summerStart = new Date(new Date().getFullYear(), 3, 7); // 4月7日
+    const winterStart = new Date(new Date().getFullYear(), 9, 7); // 10月7日
     const winterStart = new Date(new Date().getFullYear(), 9, 7); // 10月7日
 
     const now = new Date();
@@ -313,12 +390,42 @@ function getNextTimeSlotSwitchDate(isSummerTime) {
 }
 
 /**
+ * 计算本次导入的作息何时失效。
+ * 作息时间是导入时一次性写死的，不会自动跟随切令时变化，
+ * 所以这里返回下一个「切到另一种令时」的日期，用于提示用户届时重新导入。
+ * 夏令时 4 月 7 日起执行，冬令时十一假期后（10 月 7 日）起执行。
+ */
+function getNextTimeSlotSwitchDate(isSummerTime) {
+    const now = new Date();
+    const year = now.getFullYear();
+    const targetLabel = isSummerTime ? "冬令时" : "夏令时";
+
+    const candidates = [
+        { date: new Date(year, 3, 7), label: "夏令时" },
+        { date: new Date(year, 9, 7), label: "冬令时" },
+        { date: new Date(year + 1, 3, 7), label: "夏令时" },
+        { date: new Date(year + 1, 9, 7), label: "冬令时" }
+    ];
+
+    const next = candidates.find((item) => item.date > now && item.label === targetLabel);
+
+    return {
+        label: next.label,
+        text: `${next.date.getFullYear()}年${next.date.getMonth() + 1}月${next.date.getDate()}日`
+    };
+}
+
+/**
  * 检查是否在登录页面。
+ * 校内直连时地址是 http://jwxt.ujs.edu.cn/sso/jziotlogin，
+ * 校外经 WebVPN 时地址是 https://webvpn.ujs.edu.cn/http/<hex>/sso/jziotlogin，
+ * 因此按路径结尾判断，两种入口都能识别。
  * 校内直连时地址是 http://jwxt.ujs.edu.cn/sso/jziotlogin，
  * 校外经 WebVPN 时地址是 https://webvpn.ujs.edu.cn/http/<hex>/sso/jziotlogin，
  * 因此按路径结尾判断，两种入口都能识别。
  */
 function isLoginPage() {
+    return window.location.pathname.endsWith("/sso/jziotlogin");
     return window.location.pathname.endsWith("/sso/jziotlogin");
 }
 
@@ -383,6 +490,7 @@ async function selectTimeSlot() {
 
 async function reselectTimeSlot(selectedTimeSlot) {
     const options = ["对的对的，就是这个", "不对不对，应该是另外一个"];
+    const dialogTitle = "当前智能选择结果为: \n  " + (selectedTimeSlot ? "夏令时" : "冬令时") + "\n是否更改选择？";
     const dialogTitle = "当前智能选择结果为: \n  " + (selectedTimeSlot ? "夏令时" : "冬令时") + "\n是否更改选择？";
     const selectedIndex = await window.shiguangBridgePromise.showSingleSelection(
         dialogTitle,
@@ -497,6 +605,7 @@ async function fetchAndParseCourses(academicYear, semesterIndex) {
     // API URL 和请求体
     const xnmXqmBody = `xnm=${academicYear}&xqm=${semesterCode}&kzlx=ck&xsdm=&kclbdm=`;
     const url = buildApiUrl("/kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151");
+    const url = buildApiUrl("/kbcx/xskbcx_cxXsgrkb.html?gnmkdm=N2151");
 
     console.log(`JS: 发送请求到 ${url}, body: ${xnmXqmBody}`);
 
@@ -537,6 +646,21 @@ async function fetchAndParseCourses(academicYear, semesterIndex) {
 
         console.log("JS: 课程列表预览:", courses.slice(0, 5)); // 预览前5门课程
 
+        // 集中实践课（军训、形势与政策等）没有星期和节次，无法排进周课表，单独取出用于提示。
+        const practiceCourses = parsePracticeCourses(jsonData);
+        if (practiceCourses.length > 0) {
+            console.log(`JS: 检测到 ${practiceCourses.length} 门集中实践课，无法自动导入。`);
+        }
+
+        // qsxqj: 教务系统设置的一周起始星期几，缺失时按周一处理。
+        const rawFirstDay = Number(jsonData.qsxqj);
+        const firstDayOfWeek = (rawFirstDay >= 1 && rawFirstDay <= 7) ? rawFirstDay : 1;
+
+        return {
+            courses: courses,
+            practiceCourses: practiceCourses,
+            firstDayOfWeek: firstDayOfWeek
+        };
         // 集中实践课（军训、形势与政策等）没有星期和节次，无法排进周课表，单独取出用于提示。
         const practiceCourses = parsePracticeCourses(jsonData);
         if (practiceCourses.length > 0) {
@@ -708,6 +832,9 @@ function getMorningTypeFromPosition(position) {
     // 教务系统返回的是「京江2号楼2101」「京江3号楼3407」这类名称，没有「京江楼」这个写法，
     // 所以这里匹配「京江」而不是「京江楼」。
     if (text.includes("主A楼") || text.includes("京江")) return "A";
+    // 教务系统返回的是「京江2号楼2101」「京江3号楼3407」这类名称，没有「京江楼」这个写法，
+    // 所以这里匹配「京江」而不是「京江楼」。
+    if (text.includes("主A楼") || text.includes("京江")) return "A";
     if (text.includes("三江楼")) return "B";
     if (text.includes("三山楼") || text.includes("讲堂群")) return "C";
 
@@ -862,6 +989,7 @@ async function runImportFlow() {
         return;
     }
     const { courses, practiceCourses, firstDayOfWeek } = result;
+    const { courses, practiceCourses, firstDayOfWeek } = result;
 
     const coursesWithCustomTime = applyCustomTimeToCourses(courses, isSummerTime);
 
@@ -876,9 +1004,39 @@ async function runImportFlow() {
         "请在课表页面核对课程时间，如有错误请手动修改课程所在位置或节次信息。\n\n" +
         "已收录独立作息的楼栋：主A楼、京江各号楼、三江楼、三山楼、讲堂群。\n" +
         "其余楼栋（各学院楼、各实验室、运动场、未排地点等）使用默认作息时间。\n\n" +
+    // 作息时间在导入时一次性写入，不会自动跟随切令时变化，需要明确告知用户。
+    // 同时说明只有部分教学楼收录了独立作息，其余楼栋使用默认作息时间。
+    const nextSwitch = getNextTimeSlotSwitchDate(isSummerTime);
+    await window.shiguangBridgePromise.showAlert(
+        "作息时间提示",
+        `本次按${isSummerTime ? "夏令时" : "冬令时"}导入。作息时间在导入时写入，不会自动跟随学校切换令时。\n` +
+        `${nextSwitch.text}起学校切换为${nextSwitch.label}，届时请重新导入课表，或在应用内手动修改时间段。\n\n` +
+        "脚本已根据课程所在位置匹配作息时间，部分课程可能与预设时间不符。\n" +
+        "请在课表页面核对课程时间，如有错误请手动修改课程所在位置或节次信息。\n\n" +
+        "已收录独立作息的楼栋：主A楼、京江各号楼、三江楼、三山楼、讲堂群。\n" +
+        "其余楼栋（各学院楼、各实验室、运动场、未排地点等）使用默认作息时间。\n\n" +
         "欢迎其他楼栋的同学提供课程时间信息以完善脚本！",
         "我知道了"
     );
+
+    if (practiceCourses.length > 0) {
+        const practiceList = practiceCourses
+            .map((item) => {
+                const teacher = item.teacher ? `（${item.teacher}）` : "";
+                const weekDesc = item.weekDesc ? ` ${item.weekDesc}` : "";
+                return `· ${item.name}${teacher}${weekDesc}`;
+            })
+            .join("\n");
+
+        console.log("JS: 集中实践课列表:", practiceCourses);
+        await window.shiguangBridgePromise.showAlert(
+            "集中实践课需手动添加",
+            `本学期有 ${practiceCourses.length} 门集中实践课，教务系统未给出星期和节次，无法自动导入：\n\n` +
+            practiceList +
+            "\n\n请按实际安排在应用内手动添加。",
+            "我知道了"
+        );
+    }
 
     if (practiceCourses.length > 0) {
         const practiceList = practiceCourses
@@ -916,3 +1074,4 @@ async function runImportFlow() {
 }
 
 runImportFlow();
+
